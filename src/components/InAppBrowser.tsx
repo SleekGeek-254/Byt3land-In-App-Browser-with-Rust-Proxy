@@ -12,6 +12,7 @@ import {
   RotateCcw, 
   AlertTriangle,
 } from "lucide-react";
+import { selectionFeedback } from "@tauri-apps/plugin-haptics";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,7 @@ interface InAppBrowserProps {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
+  const sf = () => { try { selectionFeedback(); } catch (_) {} };
   const [blobUrl, setBlobUrl] = useState<string>("");
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -74,31 +76,118 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
       if (!/^https?:\/\//i.test(normalized))
         normalized = "https://" + normalized;
 
+      console.log("[InAppBrowser] navigate() called with:", normalized);
       setIsLoading(true);
       setError(null);
       setInputUrl(normalized);
 
       try {
-        const result = await invoke<ProxyResponse>("proxy_fetch", {
+        let result = await invoke<ProxyResponse>("proxy_fetch", {
           url: normalized,
         });
+
+        console.log("[InAppBrowser] Proxy fetch result:", {
+          title: result.title,
+          final_url: result.final_url,
+          content_type: result.content_type,
+          html_length: result.html.length,
+        });
+        console.log("[InAppBrowser] Original requested URL:", normalized);
+
+        // ── SPA Redirect Detection ─────────────────────────────────────────
+        // Cloudflare Pages returns 404.html for SPA routes like /terms, /privacy.
+        // The 404.html is a redirect page with title "Redirecting... | XXXX"
+        // that does sessionStorage.setItem + location.replace('/').
+        // In our blob: iframe, location.replace('/') breaks because sessionStorage
+        // keys don't survive cross-origin navigation.
+        // FIX: Detect the redirect page, fetch the homepage HTML ourselves,
+        // and use injectSpaRoute() with the ORIGINAL requested URL's path.
+        // Detect Cloudflare Pages SPA redirect (404.html served for non-root paths)
+        // Title "Redirecting... | XXXX" is the signature of our 404.html redirect page
+        const isSpaRedirect = result.title?.includes("Redirecting...");
+
+        let spaRedirectPath: string | null = null;
+
+        if (isSpaRedirect) {
+          console.log("[InAppBrowser] ⚠️ SPA redirect page detected!");
+          console.log("[InAppBrowser]   title:", result.title);
+          console.log("[InAppBrowser]   final_url:", result.final_url);
+          console.log("[InAppBrowser]   requested:", normalized);
+
+          // Extract the path from the ORIGINAL requested URL
+          try {
+            const parsedOriginal = new URL(normalized);
+            spaRedirectPath =
+              parsedOriginal.pathname +
+              parsedOriginal.search +
+              parsedOriginal.hash;
+            console.log(
+              "[InAppBrowser]   Will restore SPA path:",
+              spaRedirectPath,
+            );
+          } catch {
+            console.warn(
+              "[InAppBrowser]   Could not parse original URL for SPA path",
+            );
+          }
+
+          // Re-fetch the homepage (index.html) — this contains the actual React app
+          const homepageUrl = new URL(normalized).origin + "/";
+          console.log(
+            "[InAppBrowser]   Re-fetching homepage:",
+            homepageUrl,
+          );
+
+          result = await invoke<ProxyResponse>("proxy_fetch", {
+            url: homepageUrl,
+          });
+
+          console.log("[InAppBrowser] Homepage fetch result:", {
+            title: result.title,
+            final_url: result.final_url,
+            html_length: result.html.length,
+          });
+        }
+
+        // ── Inject scripts and styles ──────────────────────────────────────
+        console.log(
+          "[InAppBrowser] Injecting proxy script + scrollbar styles...",
+        );
 
         let augmented = injectProxyScript(result.html);
         augmented = injectScrollbarStyles(augmented);
 
+        // Use the ORIGINAL requested URL for SPA routing (not the homepage URL)
+        // This ensures injectSpaRoute writes the correct path (e.g. /terms) to sessionStorage
+        const spaRouteUrl = isSpaRedirect ? normalized : normalized;
+        console.log(
+          "[InAppBrowser] injectSpaRoute target URL:",
+          spaRouteUrl,
+        );
+        augmented = injectSpaRoute(augmented, spaRouteUrl);
+
+        if (spaRedirectPath) {
+          console.log(
+            "[InAppBrowser] ✅ SPA redirect path injected:",
+            spaRedirectPath,
+          );
+        }
 
         // Create blob URL
         const blob = new Blob([augmented], { type: "text/html" });
         const newBlobUrl = URL.createObjectURL(blob);
- 
+
+        console.log("[InAppBrowser] Blob URL created:", newBlobUrl);
+
         setBlobUrl(newBlobUrl);
-        setInputUrl(result.final_url);
+        // Keep the ORIGINAL requested URL in the address bar (not the homepage)
+        setInputUrl(isSpaRedirect ? normalized : result.final_url);
         setPageTitle(result.title ?? displayHost(result.final_url));
 
         if (pushHistory) {
           history.current = history.current.slice(0, histIdx.current + 1);
           history.current.push({
-            url: result.final_url,
+            url: isSpaRedirect ? normalized : result.final_url,
             title: result.title ?? "",
           });
           histIdx.current = history.current.length - 1;
@@ -106,7 +195,10 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
 
         setCanGoBack(histIdx.current > 0);
         setCanGoForward(histIdx.current < history.current.length - 1);
+
+        console.log("[InAppBrowser] ✅ Navigation complete");
       } catch (e: any) {
+        console.error("[InAppBrowser] ❌ Navigation error:", e);
         setError(String(e));
       } finally {
         setIsLoading(false);
@@ -204,6 +296,7 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
   // ── History controls ──────────────────────────────────────────────────────
 
   const goBack = () => {
+    sf();
     if (histIdx.current > 0) {
       histIdx.current -= 1;
       navigate(history.current[histIdx.current].url, false);
@@ -213,6 +306,7 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
   };
 
   const goForward = () => {
+    sf();
     if (histIdx.current < history.current.length - 1) {
       histIdx.current += 1;
       navigate(history.current[histIdx.current].url, false);
@@ -221,7 +315,7 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
     }
   };
 
-  const reload = () => navigate(inputUrl, false);
+  const reload = () => { sf(); navigate(inputUrl, false); };
 
   const handleAddressKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") navigate(inputUrl);
@@ -297,7 +391,7 @@ const InAppBrowser: React.FC<InAppBrowserProps> = ({ url, onClose }) => {
             </div>
 
             <motion.button
-              onClick={onClose}
+              onClick={() => { sf(); onClose(); }}
               whileTap={{ scale: 0.88 }}
               aria-label="Close"
               style={styles.closeBtn}
@@ -860,6 +954,104 @@ function injectScrollbarStyles(html: string): string {
   return scrollbarCSS + html;
 }
 
+// Add this helper near the top of the file
+function injectSpaRoute(html: string, targetUrl: string): string {
+  try {
+    const parsed = new URL(targetUrl);
+    const path = parsed.pathname + parsed.search + parsed.hash;
+
+    console.log("[InAppBrowser] injectSpaRoute called:", {
+      targetUrl,
+      extractedPath: path,
+    });
+
+    // ALWAYS use MemoryRouter in the proxy iframe — BrowserRouter can't work
+    // because window.location.pathname is always a blob: UUID, never "/" or "/terms".
+    // For the homepage, set the path to "/" so MemoryRouter initializes at root.
+    if (path === "/" || path === "") {
+      console.log("[InAppBrowser] injectSpaRoute: path is root, setting MemoryRouter to '/'");
+      const homeCode = `(function(){try{sessionStorage.setItem('__proxy_initial_path__','/');console.log('[InAppBrowser/iframe] sessionStorage __proxy_initial_path__ set to: /');}catch(e){}})();`;
+      const utf8Home = new TextEncoder().encode(homeCode);
+      const binHome = Array.from(utf8Home, b => String.fromCharCode(b)).join("");
+      const encHome = btoa(binHome);
+      const homeTag = `<script src="data:text/javascript;base64,${encHome}"></script>`;
+      const lower = html.toLowerCase();
+      const doctypePos = lower.indexOf("<!doctype html>");
+      if (doctypePos !== -1) {
+        const insertPos = doctypePos + "<!doctype html>".length;
+        return html.slice(0, insertPos) + homeTag + html.slice(insertPos);
+      }
+      return homeTag + html;
+    }
+
+    // Use sessionStorage instead of history.replaceState.
+    // history.replaceState silently fails inside sandboxed blob: iframes.
+    // sessionStorage IS accessible and persists for the lifetime of the iframe.
+    const code = `(function(){try{sessionStorage.setItem('__proxy_initial_path__',${JSON.stringify(path)});console.log('[InAppBrowser/iframe] sessionStorage __proxy_initial_path__ set to:',${JSON.stringify(path)});}catch(e){console.error('[InAppBrowser/iframe] Failed to set __proxy_initial_path__:',e);}})();`;
+
+    // If URL has a hash fragment, also inject a scroll-to-element handler.
+    // MemoryRouter doesn't set window.location.hash, so the browser's native
+    // scroll-to-hash doesn't work. We manually poll for the element.
+    let hashScrollCode = '';
+    if (parsed.hash && parsed.hash.length > 1) {
+      const hashId = parsed.hash.slice(1); // remove the "#"
+      hashScrollCode = `(function(){
+        var targetId = ${JSON.stringify(hashId)};
+        console.log('[InAppBrowser/iframe] Will scroll to #' + targetId + ' after React renders');
+        var attempts = 0;
+        var maxAttempts = 30;
+        function tryScroll() {
+          var el = document.getElementById(targetId);
+          if (el) {
+            console.log('[InAppBrowser/iframe] Found #' + targetId + ', scrolling into view');
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            return true;
+          }
+          return false;
+        }
+        // Try on DOMContentLoaded, then poll every 200ms
+        function startPolling() {
+          if (tryScroll()) return;
+          var interval = setInterval(function() {
+            attempts++;
+            if (tryScroll() || attempts >= maxAttempts) {
+              clearInterval(interval);
+              if (attempts >= maxAttempts) console.warn('[InAppBrowser/iframe] Could not find #' + targetId + ' after ' + maxAttempts + ' attempts');
+            }
+          }, 200);
+        }
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', function() { setTimeout(startPolling, 300); });
+        } else {
+          setTimeout(startPolling, 300);
+        }
+      })();`;
+    }
+
+    const combinedCode = code + hashScrollCode;
+
+    const utf8Bytes = new TextEncoder().encode(combinedCode);
+    const binary = Array.from(utf8Bytes, b => String.fromCharCode(b)).join("");
+    const encoded = btoa(binary);
+    // Use data: src so it won't be touched by the Rust inline-script rewriter
+    const scriptTag = `<script src="data:text/javascript;base64,${encoded}"></script>`;
+
+    // Must go right after <!doctype html> — BEFORE the proxy script and React bundles
+    const lower = html.toLowerCase();
+    const doctypePos = lower.indexOf("<!doctype html>");
+    if (doctypePos !== -1) {
+      const insertPos = doctypePos + "<!doctype html>".length;
+      return html.slice(0, insertPos) + scriptTag + html.slice(insertPos);
+    }
+    const headPos = lower.indexOf("<head>");
+    if (headPos !== -1) {
+      return html.slice(0, headPos + 6) + scriptTag + html.slice(headPos + 6);
+    }
+    return scriptTag + html;
+  } catch {
+    return html;
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
